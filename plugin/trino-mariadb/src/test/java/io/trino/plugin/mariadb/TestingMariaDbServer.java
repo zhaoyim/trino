@@ -46,9 +46,24 @@ public class TestingMariaDbServer
         execute(format("GRANT ALL PRIVILEGES ON *.* TO '%s'", container.getUsername()), "root", container.getPassword());
     }
 
+    public TestingMariaDbServer(String tag, String histogramType)
+    {
+        container = new MariaDBContainer<>(DockerImageName.parse("mariadb").withTag(tag))
+                .withDatabaseName("tpch");
+        container.withCommand("--character-set-server", "utf8mb4", format("--histogram_type=%s", histogramType)); // The default character set is latin1
+        container.start();
+        execute(format("GRANT ALL PRIVILEGES ON *.* TO '%s'", container.getUsername()), "root", container.getPassword());
+    }
+
     public void execute(String sql)
     {
         execute(sql, getUsername(), getPassword());
+    }
+
+    public Connection createConnection()
+            throws SQLException
+    {
+        return container.createConnection("");
     }
 
     private void execute(String sql, String user, String password)

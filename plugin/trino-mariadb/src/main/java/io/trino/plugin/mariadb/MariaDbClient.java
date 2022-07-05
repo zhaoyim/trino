@@ -13,7 +13,10 @@
  */
 package io.trino.plugin.mariadb;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableSet;
+import io.airlift.json.JsonCodec;
 import io.trino.plugin.base.aggregation.AggregateFunctionRewriter;
 import io.trino.plugin.base.aggregation.AggregateFunctionRule;
 import io.trino.plugin.base.expression.ConnectorExpressionRewriter;
@@ -25,6 +28,7 @@ import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcExpression;
 import io.trino.plugin.jdbc.JdbcJoinCondition;
 import io.trino.plugin.jdbc.JdbcSortItem;
+import io.trino.plugin.jdbc.JdbcStatisticsConfig;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
 import io.trino.plugin.jdbc.LongWriteFunction;
@@ -53,12 +57,20 @@ import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.connector.JoinStatistics;
 import io.trino.spi.connector.JoinType;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.statistics.ColumnStatistics;
+import io.trino.spi.statistics.DoubleRange;
+import io.trino.spi.statistics.Estimate;
+import io.trino.spi.statistics.TableStatistics;
 import io.trino.spi.type.CharType;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Decimals;
 import io.trino.spi.type.TimeType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarcharType;
+import org.jdbi.v3.core.Handle;
+import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException;
 
 import javax.inject.Inject;
 
@@ -70,6 +82,7 @@ import java.sql.SQLSyntaxErrorException;
 import java.sql.Types;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -79,12 +92,17 @@ import java.util.stream.Stream;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.emptyToNull;
+import static com.google.common.base.Strings.nullToEmpty;
+import static com.google.common.base.Throwables.throwIfInstanceOf;
 import static com.google.common.base.Verify.verify;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static io.airlift.json.JsonCodec.jsonCodec;
 import static io.trino.plugin.jdbc.DecimalConfig.DecimalMapping.ALLOW_OVERFLOW;
 import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalDefaultScale;
 import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalRounding;
 import static io.trino.plugin.jdbc.DecimalSessionSessionProperties.getDecimalRoundingMode;
 import static io.trino.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
+import static io.trino.plugin.jdbc.JdbcJoinPushdownUtil.implementJoinCostAware;
 import static io.trino.plugin.jdbc.PredicatePushdownController.DISABLE_PUSHDOWN;
 import static io.trino.plugin.jdbc.PredicatePushdownController.FULL_PUSHDOWN;
 import static io.trino.plugin.jdbc.StandardColumnMappings.bigintColumnMapping;
@@ -130,6 +148,8 @@ import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.lang.String.format;
 import static java.lang.String.join;
+import static java.util.Objects.requireNonNull;
+import static java.util.function.Function.identity;
 import static java.util.stream.Collectors.joining;
 
 public class MariaDbClient
@@ -144,12 +164,21 @@ public class MariaDbClient
     // An empty character means that the table doesn't have a comment in MariaDB
     private static final String NO_COMMENT = "";
 
+    private static final JsonCodec<ColumnHistogram> HISTOGRAM_CODEC = jsonCodec(ColumnHistogram.class);
+
+    private final boolean statisticsEnabled;
     private final AggregateFunctionRewriter<JdbcExpression, String> aggregateFunctionRewriter;
 
     @Inject
-    public MariaDbClient(BaseJdbcConfig config, ConnectionFactory connectionFactory, QueryBuilder queryBuilder, IdentifierMapping identifierMapping)
+    public MariaDbClient(
+            BaseJdbcConfig config,
+            JdbcStatisticsConfig statisticsConfig,
+            ConnectionFactory connectionFactory,
+            QueryBuilder queryBuilder,
+            IdentifierMapping identifierMapping)
     {
         super(config, "`", connectionFactory, queryBuilder, identifierMapping);
+        this.statisticsEnabled = requireNonNull(statisticsConfig, "statisticsConfig is null").isEnabled();
 
         JdbcTypeHandle bigintTypeHandle = new JdbcTypeHandle(Types.BIGINT, Optional.of("bigint"), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
         ConnectorExpressionRewriter<String> connectorExpressionRewriter = JdbcConnectorExpressionRewriterBuilder.newBuilder()
@@ -546,7 +575,13 @@ public class MariaDbClient
             // Not supported in MariaDB
             return Optional.empty();
         }
-        return super.implementJoin(session, joinType, leftSource, rightSource, joinConditions, rightAssignments, leftAssignments, statistics);
+        return implementJoinCostAware(
+                session,
+                joinType,
+                leftSource,
+                rightSource,
+                statistics,
+                () -> super.implementJoin(session, joinType, leftSource, rightSource, joinConditions, rightAssignments, leftAssignments, statistics));
     }
 
     @Override
@@ -589,5 +624,234 @@ public class MariaDbClient
         }
 
         return Optional.empty();
+    }
+
+    @Override
+    public TableStatistics getTableStatistics(ConnectorSession session, JdbcTableHandle handle, TupleDomain<ColumnHandle> tupleDomain)
+    {
+        if (!statisticsEnabled) {
+            return TableStatistics.empty();
+        }
+        if (!handle.isNamedRelation()) {
+            return TableStatistics.empty();
+        }
+        try {
+            return readTableStatistics(session, handle);
+        }
+        catch (SQLException | RuntimeException e) {
+            throwIfInstanceOf(e, TrinoException.class);
+            throw new TrinoException(JDBC_ERROR, "Failed fetching statistics for table: " + handle, e);
+        }
+    }
+
+    private TableStatistics readTableStatistics(ConnectorSession session, JdbcTableHandle table)
+            throws SQLException
+    {
+        checkArgument(table.isNamedRelation(), "Relation is not a table: %s", table);
+
+        try (Connection connection = connectionFactory.openConnection(session);
+                Handle handle = Jdbi.open(connection)) {
+            StatisticsDao statisticsDao = new StatisticsDao(handle);
+
+            Long rowCount = statisticsDao.getRowCount(table);
+
+            if (rowCount == null) {
+                // Table not found, or is a view.
+                return TableStatistics.empty();
+            }
+
+            TableStatistics.Builder tableStatistics = TableStatistics.builder();
+            tableStatistics.setRowCount(Estimate.of(rowCount));
+
+            Map<String, ColumnStatisticsResult> columnStatistics = statisticsDao.getColumnStatistics(table).stream()
+                    .collect(toImmutableMap(ColumnStatisticsResult::getColumnName, identity()));
+
+            for (JdbcColumnHandle column : this.getColumns(session, table)) {
+                ColumnStatisticsResult result = columnStatistics.get(column.getColumnName());
+                if (result == null) {
+                    continue;
+                }
+
+                ColumnStatistics.Builder columnStatisticsBuilder = ColumnStatistics.builder();
+                columnStatisticsBuilder.setNullsFraction(result.getNullsFraction()
+                        .map(Estimate::of).orElseGet(Estimate::unknown));
+
+//                columnStatisticsBuilder.setDataSize(result.getAvgLength()
+//                        .map(Estimate::of).orElseGet(Estimate::unknown));
+                columnStatisticsBuilder.setDataSize(result.getAvgLength()
+                        .flatMap(averageColumnLength ->
+                                result.getNullsFraction().map(nullsFraction ->
+                                        Estimate.of(1.0 * averageColumnLength * rowCount * (1 - nullsFraction))))
+                        .orElseGet(Estimate::unknown));
+
+                // only JSON_HB has distinct value
+                // SINGLE_PREC_HB and DOUBLE_PREC_HB do NOT have distinct value
+                if (result.getHistType() != null && result.getHistogram() != null) {
+                    if (result.getHistType().equals("JSON_HB")) {
+                        long distinctValues = 0;
+                        // distinct_values_count
+                        Optional<ColumnHistogram> histogram = Optional.ofNullable(result.getHistogram())
+                                .flatMap(histogramJson -> {
+                                    try {
+                                        return Optional.of(HISTOGRAM_CODEC.fromJson(histogramJson));
+                                    }
+                                    catch (RuntimeException e) {
+                                        return Optional.empty();
+                                    }
+                                });
+                        for (Map obj : histogram.get().histogramHB.get()) {
+                            distinctValues += (Integer) obj.get("ndv");
+                        }
+                        columnStatisticsBuilder.setDistinctValuesCount(Optional.of(distinctValues)
+                                .map(Estimate::of).orElseGet(Estimate::unknown));
+                    }
+                }
+
+                Type type = column.getColumnType();
+                // MariaDB Date, Time and Timestamp also have the min and max value
+                // But currently, we only consider the numbers
+                if (type == TINYINT ||
+                        type == SMALLINT ||
+                        type == INTEGER ||
+                        type == BIGINT ||
+                        type == REAL ||
+                        type == DOUBLE ||
+                        type instanceof DecimalType) {
+                    // low_value and high_value
+                    if (result.getMinValue() != null && result.getMaxValue() != null) {
+                        DoubleRange range = new DoubleRange(Double.parseDouble(result.getMinValue()), Double.parseDouble(result.getMaxValue()));
+                        columnStatisticsBuilder.setRange(range);
+                    }
+                }
+
+                tableStatistics.setColumnStatistics(column, columnStatisticsBuilder.build());
+            }
+            return tableStatistics.build();
+        }
+    }
+
+    private static class StatisticsDao
+    {
+        private final Handle handle;
+
+        public StatisticsDao(Handle handle)
+        {
+            this.handle = requireNonNull(handle, "handle is null");
+        }
+
+        Long getRowCount(JdbcTableHandle table)
+        {
+            return handle.createQuery("" +
+                            "SELECT cardinality FROM mysql.table_stats " +
+                            "WHERE db_name = :schema AND table_name = :table_name ")
+                    .bind("schema", table.getCatalogName())
+                    .bind("table_name", table.getTableName())
+                    .mapTo(Long.class)
+                    .findOne()
+                    .orElse(null);
+        }
+
+        List<ColumnStatisticsResult> getColumnStatistics(JdbcTableHandle table)
+        {
+            try {
+                handle.execute("SELECT 1 FROM mysql.column_stats WHERE 0=1");
+            }
+            catch (UnableToExecuteStatementException e) {
+                if (nullToEmpty(e.getMessage()).contains("Unknown table 'mysql.column_stats'")) {
+                    return new ArrayList<>();
+                }
+            }
+
+            return handle.createQuery("" +
+                            "SELECT column_name, avg_length, min_value, max_value, nulls_ratio, hist_type, " +
+                            "decode_histogram(hist_type, histogram) as histogram FROM mysql.column_stats " +
+                            "WHERE db_name = :schema AND table_name = :table_name")
+                    .bind("schema", table.getCatalogName())
+                    .bind("table_name", table.getTableName())
+                    .map((rs, ctx) -> new ColumnStatisticsResult(
+                            requireNonNull(rs.getString("column_name"), "column_name is null"),
+                            Optional.ofNullable(rs.getObject("avg_length", Float.class)),
+                            rs.getString("min_value"),
+                            rs.getString("max_value"),
+                            rs.getString("hist_type"),
+                            rs.getString("histogram"),
+                            Optional.ofNullable(rs.getObject("nulls_ratio", Float.class))))
+                    .list();
+        }
+    }
+
+    private static class ColumnStatisticsResult
+    {
+        private final String columnName;
+
+        private final Optional<Float> avgLength;
+        private final String minValue;
+        private final String maxValue;
+        private final String histType;
+        private final String histogram;
+        private final Optional<Float> nullsFraction;
+
+        public String getColumnName()
+        {
+            return columnName;
+        }
+
+        public Optional<Float> getAvgLength()
+        {
+            return avgLength;
+        }
+
+        public String getMinValue()
+        {
+            return minValue;
+        }
+
+        public String getMaxValue()
+        {
+            return maxValue;
+        }
+
+        public String getHistType()
+        {
+            return histType;
+        }
+
+        public String getHistogram()
+        {
+            return histogram;
+        }
+
+        public Optional<Float> getNullsFraction()
+        {
+            return nullsFraction;
+        }
+
+        public ColumnStatisticsResult(String columnName, Optional<Float> avgLength,
+                                      String minValue, String maxValue,
+                                      String histType, String histogram, Optional<Float> nullsFraction)
+        {
+            this.columnName = columnName;
+            this.avgLength = avgLength;
+            this.minValue = minValue;
+            this.maxValue = maxValue;
+            this.histType = histType;
+            this.histogram = histogram;
+            this.nullsFraction = nullsFraction;
+        }
+    }
+
+    public static class ColumnHistogram
+    {
+        private final Optional<Integer> histogramSize;
+        private final Optional<List<Map>> histogramHB;
+
+        @JsonCreator
+        public ColumnHistogram(
+                @JsonProperty("target_histogram_size") Optional<Integer> histogramSize,
+                @JsonProperty("histogram_hb") Optional<List<Map>> histogramHB)
+        {
+            this.histogramSize = histogramSize;
+            this.histogramHB = histogramHB;
+        }
     }
 }
